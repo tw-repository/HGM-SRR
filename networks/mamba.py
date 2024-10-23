@@ -1,11 +1,7 @@
-import math
-import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 from einops import rearrange, repeat
-from pscan import Scan as pscan
 
 
 SIZE = 2048
