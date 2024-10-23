@@ -3,13 +3,12 @@
 import random
 import argparse
 import numpy as np
-import pandas as pd
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from tqdm import tqdm
-from dataset_HGNN import DataSet
+from data.dataset_HGNN import DataSet
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -191,7 +190,6 @@ def validate(val_loader, model):
         obj1_var = torch.autograd.Variable(obj1).cuda()
         obj2_var = torch.autograd.Variable(obj2).cuda()
         bpos_var = torch.autograd.Variable(bpos).cuda()
-        full_im_var = torch.autograd.Variable(full_im).cuda()
         scene_graph_bbox = torch.autograd.Variable(scene_graph_bbox).cuda()
         scene_box_num = torch.autograd.Variable(scene_box_num).cuda()
         scene_im = torch.autograd.Variable(scene_im).cuda()
@@ -209,14 +207,10 @@ def validate(val_loader, model):
             else:
                 count += rel_num
 
-        img_rel_num = torch.autograd.Variable(img_rel_num).cuda()
-        edge_index = torch.autograd.Variable(edge_index).cuda()
-
         target_var = torch.autograd.Variable(target)
 
         with torch.no_grad():
-            output = model(union_var, obj1_var, obj2_var, bpos_var, full_im_var,
-                           img_rel_num, edge_index, scene_graph_bbox, scene_box_num, scene_im)
+            output = model(union_var, obj1_var, obj2_var, bpos_var, scene_graph_bbox, scene_box_num, scene_im)
 
         output_f = F.softmax(output, dim=1)
         output_np = output_f.data.cpu().numpy()
@@ -258,9 +252,7 @@ def validate(val_loader, model):
 
 
 def train(train_loader, test_loader, model, criterion, optimizer):
-    best_mAP = 0
     best_prec = 0
-    result_in = np.zeros((1, 1, num_class + 1))
     for i in range(args.start_epoch, args.start_epoch + args.epochs):
         model.train()
         losses = AverageMeter()
@@ -277,7 +269,6 @@ def train(train_loader, test_loader, model, criterion, optimizer):
             obj1_var = torch.autograd.Variable(obj1).cuda()
             obj2_var = torch.autograd.Variable(obj2).cuda()
             bpos_var = torch.autograd.Variable(bpos).cuda()
-            full_im_var = torch.autograd.Variable(full_im).cuda()
             scene_graph_bbox = torch.autograd.Variable(scene_graph_bbox).cuda()
             scene_box_num = torch.autograd.Variable(scene_box_num).cuda()
             scene_im = torch.autograd.Variable(scene_im).cuda()
@@ -293,14 +284,10 @@ def train(train_loader, test_loader, model, criterion, optimizer):
                 else:
                     count += rel_num
 
-            img_rel_num = torch.autograd.Variable(img_rel_num).cuda()
-            edge_index = torch.autograd.Variable(edge_index).cuda()
-
             target_var = torch.autograd.Variable(target)
             optimizer.zero_grad()
 
-            output = model(union_var, obj1_var, obj2_var, bpos_var, full_im_var,
-                                        img_rel_num, edge_index, scene_graph_bbox, scene_box_num, scene_im)
+            output = model(union_var, obj1_var, obj2_var, bpos_var, scene_graph_bbox, scene_box_num, scene_im)
 
             loss = criterion(output, target_var)
 
@@ -323,7 +310,7 @@ def train(train_loader, test_loader, model, criterion, optimizer):
             torch.save({"epoch": i,
                         "state_dict": model.state_dict(),
                         "optimizer": optimizer.state_dict()},
-                       "{}/vhgnn_model_{}_{:.2%}_{:.2%}.pth.tar".format(args.result_path, i, prec, mAP))
+                       "{}/vhgnn_model_{}_{:.2%}_{:.2%}.pth.tar".format(args.result_path, i, prec))
 
         total_losses.reset()
         print(recall)
@@ -391,7 +378,7 @@ def generate_graph(rel_num, scene=args.scene):
 def init_network(net, num_class):
 
     if net == 'GGNN_attn':
-        from network import network
+        from networks.network import network
         model = network(num_class)
         for m in model.person_pair.parameters():
             m.requires_grad = False
@@ -436,23 +423,6 @@ def init_network(net, num_class):
     return model, params
 
 
-def load_pretrain_model(model):
-    print("====> loading pretrained place365 model ", flush=True)
-
-    model_dict = model.full_im_net.state_dict()
-
-    pretrained_dict = torch.load(r'/xxxx/resnet50_places365.pth.tar')
-    # 1. filter out unnecessary keys
-    pretrained_dict = {k.replace('module.', ''): v for k, v in pretrained_dict['state_dict'].items() if
-                       k.replace('module.', '') in model_dict}
-    # 2. overwrite entries in the existing state dict
-    del pretrained_dict['fc.weight']
-    del pretrained_dict['fc.bias']
-    model_dict.update(pretrained_dict)
-    model.full_im_net.load_state_dict(model_dict)
-    print("-----------------over-------------------")
-    return model
-
 
 if __name__ == '__main__':
     # Create dataloader
@@ -464,8 +434,7 @@ if __name__ == '__main__':
     print('====> Loading the network...')
     model, params = init_network(args.network, num_class)
 
-    model = load_pretrain_model(model)
-    optimizer = torch.optim.SGD(params, weight_decay=0.0005, lr=args.lr)
+    optimizer = torch.optim.AdamW(params, weight_decay=0.0005, lr=args.lr)
 
     criterion = torch.nn.CrossEntropyLoss().cuda()
     model.cuda()
