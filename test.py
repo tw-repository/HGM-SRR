@@ -15,7 +15,7 @@ from tqdm import tqdm
 import argparse
 import random
 
-from dataset_HGNN import DataSet
+from data.dataset_HGNN import DataSet
 
 seed = 10
 os.environ['PYTHONHASHSEED'] = str(seed)
@@ -160,7 +160,6 @@ def validate(val_loader, model):
         obj1_var = torch.autograd.Variable(obj1).cuda()
         obj2_var = torch.autograd.Variable(obj2).cuda()
         bpos_var = torch.autograd.Variable(bpos).cuda()
-        full_im_var = torch.autograd.Variable(full_im).cuda()
         scene_graph_bbox = torch.autograd.Variable(scene_graph_bbox).cuda()
         scene_box_num = torch.autograd.Variable(scene_box_num).cuda()
         scene_im = torch.autograd.Variable(scene_im).cuda()
@@ -178,14 +177,10 @@ def validate(val_loader, model):
             else:
                 count += rel_num
 
-        img_rel_num = torch.autograd.Variable(img_rel_num).cuda()
-        edge_index = torch.autograd.Variable(edge_index).cuda()
-
         target_var = torch.autograd.Variable(target)
 
         with torch.no_grad():
-            output = model(union_var, obj1_var, obj2_var, bpos_var, full_im_var,
-                           img_rel_num, edge_index, scene_graph_bbox, scene_box_num, scene_im)
+            output = model(union_var, obj1_var, obj2_var, bpos_var, scene_graph_bbox, scene_box_num, scene_im)
 
         output_f = F.softmax(output, dim=1)
         output_np = output_f.data.cpu().numpy()
@@ -193,11 +188,6 @@ def validate(val_loader, model):
         t = target_var.data.cpu().numpy()
 
         for i, item in enumerate(t):
-
-            true_i = np.array(item)
-
-            pre_i = np.array(pre[i])
-
             if item in r:
                 r[item] += 1
             else:
@@ -229,14 +219,13 @@ def validate(val_loader, model):
         p_total += p[k]
     precision_total = float(tp_total) / float(p_total)
 
-
     return precision_total, recall
 
 
 def init_network(net, num_class):
     # Initialize the network.
     if net == 'GGNN_attn':
-        from network import network
+        from networks.network import network
 
     model = network(num_class)
     return model
