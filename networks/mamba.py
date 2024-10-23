@@ -4,31 +4,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from einops import rearrange, repeat, einsum
+from einops import rearrange, repeat
+from pscan import Scan as pscan
 
-"""
-Glossary:
-    b: batch size                       (`B` in Mamba paper [1] Algorithm 2)
-    l: sequence length                  (`L` in [1] Algorithm 2)
-    d or d_model: hidden dim
-    n or d_state: latent state dim      (`N` in [1] Algorithm 2)
-    expand: expansion factor            (`E` in [1] Section 3.4)
-    d_in or d_inner: d * expand         (`D` in [1] Algorithm 2)
-    A, B, C, D: state space parameters  (See any state space representation formula)
-                                        (B, C are input-dependent (aka selective, a key innovation in Mamba); A, D are not)
-    Δ or delta: input-dependent step size
-    dt_rank: rank of Δ                  (See [1] Section 3.6 "Parameterization of ∆")
 
-"""
 SIZE = 2048
 d_state = 16
 d_conv = 4
+num_states = SIZE
+num_observations = 2
 
 
 class mamba_block(nn.Module):
-    def __init__(self, num_classes=6):
+    def __init__(self, window):
         super(mamba_block, self).__init__()
 
+        self.window = window
         self.in_proj = nn.Linear(SIZE, SIZE * 2)
         self.out_proj = nn.Linear(SIZE, SIZE)
         self.x_proj = nn.Linear(SIZE, SIZE + d_state * 2, bias=False)
@@ -40,36 +31,48 @@ class mamba_block(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(SIZE))
 
+        self.conv = nn.Conv1d(SIZE, SIZE, kernel_size=d_conv, padding=d_conv - 1)
+
     def forward(self, x, sim):
 
         x = x.unsqueeze(0)
         (b, l, d) = x.shape
 
-        x_and_res = self.in_proj(x)  # shape (b, l, 2 * d_in)
+        x_and_res = self.in_proj(x)
         (x, res) = x_and_res.split(split_size=[SIZE, SIZE], dim=-1)
 
+        x = nn.BatchNorm1d(x)
         x = rearrange(x, 'b l d_in -> b d_in l')
         x = self.conv(x)[:, :, :l]
         x = rearrange(x, 'b d_in l -> b l d_in')
-
         x = F.silu(x)
 
-        y = self.ssm(x, sim)
+        x_mask = torch.matmul(x, sim)
 
-        y = y * F.silu(res)
+        x_1d = x_mask.view(-1, 1, 2048)
+        padding = (self.window - 1) // 2
+        conv = F.conv1d(x_1d, torch.ones(1, 1, self.window, dtype=x_mask.dtype, device=x_mask.device), padding=padding)
+        conv = conv.view(-1, 2048)
+        conv = conv / self.window
 
-        output = self.out_proj(y)
-        output = output.squeeze(0)
+        x_mask_1 = self.ssm(x_mask)
+        x_mask_2 = self.ssm(torch.flip(x_mask, dims=[1]))
+        x_mask_3 = self.ssm(conv)
+        x_mask_4 = self.ssm(torch.flip(conv, dims=[1]))
 
-        return output
+        x_merge = x_mask_1 + x_mask_2 + x_mask_3 + x_mask_4
 
-    def ssm(self, x, sim):
+        res = nn.LayerNorm(res)
+        res = rearrange(res, 'b l d_in -> b d_in l')
+        res = self.conv(res)[:, :, :l]
+        res = rearrange(res, 'b d_in l -> b l d_in')
+
+        y = x_merge + F.relu(res)
+
+        return y
+
+    def ssm(self, x):
         (d_in, n) = self.A_log.shape
-
-        # Compute ∆ A B C D, the state space parameters.
-        #     A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
-        #     ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
-        #                                  and is why Mamba is called **selective** state spaces)
 
         A = -torch.exp(self.A_log.float())  # shape (d_in, n)
         D = self.D.float()
@@ -79,58 +82,28 @@ class mamba_block(nn.Module):
         (delta, B, C) = x_dbl.split(split_size=[SIZE, n, n], dim=-1)  # delta: (b, l, dt_rank). B, C: (b, l, n)
         delta = F.softplus(self.dt_proj(delta))  # (b, l, d_in)
 
-        y = self.selective_scan(x, delta, A, B, C, D, sim)  # This is similar to run_SSM(A, B, C, u) in The Annotated S4 [2]
+        y = self.selective_scan(x, delta, A, B, C, D)
 
         return y
 
-    def selective_scan(self, u, delta, A, B, C, D, sim):
-        """Does selective scan algorithm. See:
-            - Section 2 State Space Models in the Mamba paper [1]
-            - Algorithm 2 in Section 3.2 in the Mamba paper [1]
-            - run_SSM(A, B, C, u) in The Annotated S4 [2]
+    def selective_scan(self, u, delta, A, B, C, D):
+        _, L, _ = u.shape
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)
 
-        This is the classic discrete state space formula:
-            x(t + 1) = Ax(t) + Bu(t)
-            y(t)     = Cx(t) + Du(t)
-        except B and C (and the step size delta, which is used for discretization) are dependent on the input x(t).
+        BX = deltaB * (u.unsqueeze(-1))
 
-        Args:
-            u: shape (b, l, d_in)    (See Glossary at top for definitions of b, l, d_in, n...)
-            delta: shape (b, l, d_in)
-            A: shape (d_in, n)
-            B: shape (b, l, n)
-            C: shape (b, l, n)
-            D: shape (d_in,)
+        h = torch.zeros(u.size(0), SIZE, d_state, device=deltaA.device)
+        hs = []
 
-        Returns:
-            output: shape (b, l, d_in)
+        for t in range(0, L):
+            h = deltaA[:, t] * h + BX[:, t]
+            hs.append(h)
 
-        Official Implementation:
-            selective_scan_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L86
-            Note: I refactored some parts out of `selective_scan_ref` out, so the functionality doesn't match exactly.
+        hs = torch.stack(hs, dim=1)
 
-        """
-        (b, l, d_in) = u.shape
-        n = A.shape[1]
-        # Discretize continuous parameters (A, B)
-        # - A is discretized using zero-order hold (ZOH) discretization (see Section 2 Equation 4 in the Mamba paper [1])
-        # - B is discretized using a simplified Euler discretization instead of ZOH. From a discussion with authors:
-        #   "A is the more important term and the performance doesn't change much with the simplification on B"
-        deltaA = torch.exp(einsum(delta, A, 'b l d_in, d_in n -> b l d_in n'))
-        deltaB_u = einsum(delta, B, u, 'b l d_in, b l n, b l d_in -> b l d_in n')
+        y = (hs @ C.unsqueeze(-1)).squeeze(3)
 
-        # Perform selective scan (see scan_SSM() in The Annotated S4 [2])
-        # Note that the below is sequential, while the official implementation does a much faster parallel scan that
-        # is additionally hardware-aware (like FlashAttention).
-        x = torch.zeros((b, d_in, n), device=deltaA.device)
-        ys = []
-        for i in range(l):
-            x = deltaA[:, i] * x + deltaB_u[:, i]
-            y = einsum(x, C[:, i, :], 'b d_in n, b n -> b d_in')
-            ys.append(y)
-        y = torch.stack(ys, dim=1)  # shape (b, l, d_in)
-
-        result = torch.bmm(y, sim.permute(0, 2, 1))
-        y = result + u * D
+        y = y + D * u
 
         return y
