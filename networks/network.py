@@ -180,7 +180,6 @@ class network(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, 2048))
         self.multiattn_intra = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
         self.multiattn_pairfuse = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
-        self.multiattn_inter = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
         self.full_im_net = resnet50(pretrained=False)
         self.obj_unary = nn.Linear(1000, SIZE * 4)
         self.cls_to_size = nn.Linear(2048, num_classes)
@@ -305,46 +304,19 @@ class network(nn.Module):
         x4 = x4[:, np.newaxis, :]
         fea_mhsa = fea_mhsa[:, 0, :].unsqueeze(1)
         hyperGraph_output_scene = hyperGraph_output_scene[:, np.newaxis, :]
+                    
+        additional_rows = abs(x1.shape[0] - hyperGraph_output_scene.shape[0])
 
-        if x1.shape[0] < hyperGraph_output_scene.shape[0]:
-            hyperGraph_output_scene = hyperGraph_output_scene[:x1.shape[0], :, :]
-        elif x1.shape[0] > hyperGraph_output_scene.shape[0]:
-            additional_rows = x1.shape[0] - hyperGraph_output_scene.shape[0]
-            additional_info = torch.zeros(additional_rows, 1, 2048)
+        if fea_mhsa.shape[0] < hyperGraph_output_scene.shape[0]:
+            additional_info = torch.randn(additional_rows, 1, 2048)
+            fea_mhsa = torch.cat((fea_mhsa, additional_info.cuda()), dim=0)
+            fea_mhsa = torch.cat((fea_mhsa, hyperGraph_output_scene, SG_feature), dim=-2)
+        elif fea_mhsa.shape[0] > hyperGraph_output_scene.shape[0]:
+            additional_info = torch.randn(additional_rows, 1, 2048)
             hyperGraph_output_scene = torch.cat((hyperGraph_output_scene, additional_info.cuda()), dim=0)
+            fea_mhsa = torch.cat((fea_mhsa, hyperGraph_output_scene, SG_feature), dim=-2)
 
-        fea_mhsa = torch.cat((fea_mhsa, hyperGraph_output_scene, x1, x4), dim=-2)
         fea_mhsa = self.multiattn_pairfuse(fea_mhsa)
-
-        cls_attn = fea_mhsa[:, 0, :]
-
-        rel_num_1 = img_rel_num[0]
-        count = int(rel_num_1)
-        count_img = 0
-
-        rois_feature_1 = scene_graph_vis_info[0].unsqueeze(0).unsqueeze(0)
-        img_inter_1 = cls_attn[0:rel_num_1].unsqueeze(0)
-        img_inter_1 = torch.cat((rois_feature_1, img_inter_1), dim=1)
-        output = self.multiattn_inter(img_inter_1).squeeze(0)
-        output = output[1:, :]
-
-        for rel_num in img_rel_num[1:]:
-            if rel_num == 1:
-                test_cls = cls_attn[count].unsqueeze(dim=0).unsqueeze(dim=0)
-                rois_feature_1 = scene_graph_vis_info[count_img].unsqueeze(0).unsqueeze(0)
-                img_inter = torch.cat((rois_feature_1, test_cls), dim=1)
-                output_1 = self.multiattn_inter(img_inter).squeeze(0)
-                output = torch.cat((output, output_1[1:, :]), dim=0)
-            else:
-                img_inter = cls_attn[count:(count + rel_num)].unsqueeze(0)
-                rois_feature_1 = scene_graph_vis_info[count_img].unsqueeze(0).unsqueeze(0)
-                img_inter = torch.cat((rois_feature_1, img_inter), dim=1)
-                output_1 = self.multiattn_inter(img_inter).squeeze(0)
-                output = torch.cat((output, output_1[1:, :]), dim=0)
-            count += rel_num
-            count_img = count_img + 1
-
-        result = self.cls_to_size(output)
-
+        result = self.cls_to_size(self.ReLU(fea_mhsa))
         return result
 
