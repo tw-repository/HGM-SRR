@@ -1,9 +1,3 @@
-# person_pair.py
-"""
-Concatenate the features of position, pair (person A and person B) and union.
-"""
-
-
 from utils.transformer import Transformer
 import torch
 import torch.nn as nn
@@ -180,6 +174,7 @@ class network(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, 2048))
         self.multiattn_intra = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
         self.multiattn_pairfuse = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+
         self.full_im_net = resnet50(pretrained=False)
         self.obj_unary = nn.Linear(1000, SIZE * 4)
         self.cls_to_size = nn.Linear(2048, num_classes)
@@ -192,15 +187,12 @@ class network(nn.Module):
         self.SG_TRM = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
         self.SG_vis_global = nn.Parameter(torch.randn(1, 1, 2048))
 
-        self.HGNN1 = HGNN(2048, 0.5)
-        self.HGNN2 = HGNN(2048, 0.5)
+        self.HGNN1 = HGNN(2048, 0.5, 2)
+        self.HGNN2 = HGNN(2048, 0.5, 2)
 
-    def forward(self, union, b1, b2, b_geometric, full_im, img_rel_num, edge_index, scene_graph_bbox, scene_box_num,
-                scene_im):
-        rois_feature = self.full_im_net(full_im)  # full image =====scene feature
+    def forward(self, union, b1, b2, b_geometric, scene_graph_bbox, scene_box_num, scene_im):
         x4, x1, x2, x3 = self.person_pair(union, b1, b2, b_geometric)  # crop image =====people feature
 
-        full_im_feature = self.obj_unary(rois_feature)
         SG_feature = self.SG_FE(scene_im)
         # scene graph bbox
         count = 0
@@ -222,14 +214,10 @@ class network(nn.Module):
             scene_graph_bbox_i = self.gcn(scene_graph_bbox_i, edge)[0, :].unsqueeze(0)
             scene_graph_pos_info = torch.cat([scene_graph_pos_info, scene_graph_bbox_i], dim=0)
 
-        scene_features = torch.cat((scene_graph_vis_info, SG_feature, full_im_feature, scene_graph_pos_info), 0)
+        scene_features = torch.cat((scene_graph_vis_info, SG_feature, scene_graph_pos_info), 0)
         distances_scene = torch.cdist(
-            torch.stack([zoh_discretize(scene_graph_vis_info.T), zoh_discretize(full_im_feature.T),
-                         zoh_discretize(scene_graph_pos_info.T)],
-                        dim=0),
-            torch.stack([zoh_discretize(scene_graph_vis_info.T), zoh_discretize(full_im_feature.T),
-                         zoh_discretize(scene_graph_pos_info.T)],
-                        dim=0))
+            torch.stack([zoh_discretize(scene_graph_vis_info.T), zoh_discretize(scene_graph_pos_info.T)], dim=0),
+            torch.stack([zoh_discretize(scene_graph_vis_info.T), zoh_discretize(scene_graph_pos_info.T)], dim=0))
 
         distances_scene = torch.sum(distances_scene, dim=0, keepdim=True)
         max_distance_scene = torch.max(distances_scene)
@@ -252,11 +240,9 @@ class network(nn.Module):
                                               is_probH=True, m_prob=1)
         H_scene = hgut.hyperedge_concat(H_scene, tmp_scene)
         G_scene = hgut.generate_G_from_H(H_scene)
-        fts_scene = fts_scene.cpu()
         G_scene = torch.Tensor(G_scene).cpu()
         hyperGraph_output_scene = self.HGNN1(fts_scene.cuda(), G_scene.cuda(),
                                              normalized_distances_masked_scene.squeeze(0).cuda())
-
 
         person_features = torch.cat((x4, x1, x2, x3), 0)
 
@@ -266,13 +252,11 @@ class network(nn.Module):
             torch.stack([zoh_discretize(x4.T), zoh_discretize(x1.T), zoh_discretize(x2.T), zoh_discretize(x3.T)],
                         dim=0))
 
-
         distances = torch.sum(distances, dim=0, keepdim=True)
         max_distance = torch.max(distances)
         normalized_distances = distances / max_distance
 
         mask = normalized_distances > threshold
-        count_above_threshold = torch.sum(mask).item()
         normalized_distances_masked = torch.where(mask.cuda(), torch.tensor(0.0).cuda(),
                                                   normalized_distances).squeeze(0)
 
@@ -282,17 +266,15 @@ class network(nn.Module):
 
         # construct hypergraph incidence matrix
         H_person = None
-        tmp_person = hgut.construct_H_with_KNN(person_features.cpu().detach().numpy(), K_neigs=[50],
+        tmp_person = hgut.construct_H_with_KNN(person_features.cpu().detach().numpy(), K_neigs=[10],
                                                split_diff_scale=False,
                                                is_probH=True, m_prob=1)
         H_person = hgut.hyperedge_concat(H_person, tmp_person)
         G_person = hgut.generate_G_from_H(H_person)
-        fts_person = fts_person
         G_person = torch.Tensor(G_person)
         hyperGraph_output_person = self.HGNN2(fts_person.cuda(), G_person.cuda(), normalized_distances_masked)
 
         cls_tokens = repeat(self.cls_token, '() n d -> b n d', b=x2.shape[0])
-
 
         x2 = x2[:, np.newaxis, :]
         x3 = x3[:, np.newaxis, :]
@@ -304,7 +286,7 @@ class network(nn.Module):
         x4 = x4[:, np.newaxis, :]
         fea_mhsa = fea_mhsa[:, 0, :].unsqueeze(1)
         hyperGraph_output_scene = hyperGraph_output_scene[:, np.newaxis, :]
-                    
+
         additional_rows = abs(x1.shape[0] - hyperGraph_output_scene.shape[0])
 
         if fea_mhsa.shape[0] < hyperGraph_output_scene.shape[0]:
