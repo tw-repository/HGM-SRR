@@ -32,16 +32,15 @@ class mamba_block(nn.Module):
     def forward(self, x, sim):
 
         x = x.unsqueeze(0)
+        sim = sim.unsqueeze(0)
         (b, l, d) = x.shape
 
         x_and_res = self.in_proj(x)
         (x, res) = x_and_res.split(split_size=[SIZE, SIZE], dim=-1)
 
-        x = nn.BatchNorm1d(x)
         x = rearrange(x, 'b l d_in -> b d_in l')
         x = self.conv(x)[:, :, :l]
         x = rearrange(x, 'b d_in l -> b l d_in')
-        x = F.silu(x)
 
         x_mask = torch.matmul(x, sim)
 
@@ -53,17 +52,11 @@ class mamba_block(nn.Module):
 
         x_mask_1 = self.ssm(x_mask)
         x_mask_2 = self.ssm(torch.flip(x_mask, dims=[1]))
-        x_mask_3 = self.ssm(conv)
-        x_mask_4 = self.ssm(torch.flip(conv, dims=[1]))
+        x_mask_3 = self.ssm(conv.unsqueeze(0))
+        x_mask_4 = self.ssm(torch.flip(conv.unsqueeze(0), dims=[1]))
 
         x_merge = x_mask_1 + x_mask_2 + x_mask_3 + x_mask_4
-
-        res = nn.LayerNorm(res)
-        res = rearrange(res, 'b l d_in -> b d_in l')
-        res = self.conv(res)[:, :, :l]
-        res = rearrange(res, 'b d_in l -> b l d_in')
-
-        y = x_merge + F.relu(res)
+        y = F.silu(x_merge) + F.relu(res)
 
         return y
 
@@ -80,7 +73,7 @@ class mamba_block(nn.Module):
 
         y = self.selective_scan(x, delta, A, B, C, D)
 
-        return y
+        return y.squeeze(0)
 
     def selective_scan(self, u, delta, A, B, C, D):
         _, L, _ = u.shape
