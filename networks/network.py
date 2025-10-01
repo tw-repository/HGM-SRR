@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
-from vgg_v1 import resnet50
+from torchvision.models import resnet50
 from torch_geometric.nn import GatedGraphConv, GCNConv
 from einops import repeat, rearrange
 from timm import create_model
@@ -301,4 +301,5 @@ class network(nn.Module):
         fea_mhsa = self.multiattn_pairfuse(fea_mhsa)
         result = self.cls_to_size(self.ReLU(fea_mhsa))
         return result
+
 
