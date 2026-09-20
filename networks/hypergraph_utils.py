@@ -1,9 +1,4 @@
-# --------------------------------------------------------
-# Utility functions for Hypergraph
-#
-# Author: Yifan Feng
-# Date: November 2018
-# --------------------------------------------------------
+
 import numpy as np
 
 
